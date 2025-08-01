@@ -210,7 +210,7 @@ async def search_internal_flight(request: FlightSearchRequest):
         row = cursor.fetchone()
 
         if not row:
-            raise HTTPException(status_code=404, detail="No matching internal flight found.")
+            return []
 
         # Combine travel_date + time to form full datetime
         dep_time = row[5] or datetime.min.time()
@@ -462,6 +462,7 @@ async def search_connecting_flights(request: FlightSearchRequest):
             ))
 
         return results
+
     
 @app.post("/flights/book", response_model=BookingResponse)
 async def book_flight(request: BookingRequest):
