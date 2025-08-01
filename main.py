@@ -231,7 +231,31 @@ async def search_internal_flight(request: FlightSearchRequest):
         "available_seats": row[9]
     }]
 
-@app.post("/flights/search", response_model=List[ConnectingFlightResult])
+
+@app.post("/flights/search")
+async def search_all_flights(request: FlightSearchRequest):
+    try:
+        # 1. Validate date
+        datetime.strptime(request.travel_date, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid date format. Use YYYY-MM-DD.")
+
+    # 2. Search for direct flights
+    direct_flights = await search_flights(request)
+
+    if len(direct_flights) >= request.limit:
+        return direct_flights[:request.limit]
+
+    # 3. If not enough direct flights, get connecting ones
+    remaining = request.limit - len(direct_flights)
+    if remaining > 0:
+        connecting_flights = await search_connecting_flights(request)
+        combined = direct_flights + connecting_flights[:remaining]
+        return combined
+
+    return direct_flights
+
+@app.post("/flights/search-direct", response_model=List[ConnectingFlightResult])
 async def search_flights(request: FlightSearchRequest):
     """
     Search for direct flights based on source city, destination city, date and seat availability.
