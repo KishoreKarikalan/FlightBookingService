@@ -9,12 +9,12 @@ from dataclasses import dataclass
 
 app = FastAPI(title="Flight Booking API", version="1.0.0")
 
-# Pydantic models
 class FlightSearchRequest(BaseModel):
-    source_airport: str = Field(..., description="Source airport code")
-    destination_airport: str = Field(..., description="Destination airport code")
-    travel_date: date = Field(..., description="Travel date")
+    source_city: str = Field(..., description="Source city name")
+    destination_city: str = Field(..., description="Destination city name") 
+    travel_date: str = Field(..., description="Travel date")
     seats_required: int = Field(..., gt=0, description="Number of seats required")
+    limit: int = Field(5, ge=1, description="Maximum number of results to return")
 
 class FlightResult(BaseModel):
     flight_id: int
@@ -22,8 +22,8 @@ class FlightResult(BaseModel):
     flight_number: str
     source_airport: str
     destination_airport: str
-    departure_time: time
-    arrival_time: time
+    departure_time: datetime
+    arrival_time: datetime
     duration_minutes: int
     base_price: float
     available_seats: int
@@ -122,13 +122,6 @@ def get_airport_id_by_code(cursor, airport_code: str) -> Optional[int]:
 async def root():
     return {"message": "Flight Booking API is running"}
 
-# Updated request model
-class FlightSearchRequest(BaseModel):
-    source_city: str           # Changed from source_airport
-    destination_city: str      # Changed from destination_airport  
-    travel_date: str
-    seats_required: int
-
 def get_airports_by_city_name(cursor, city_name: str):
     """
     Get all airport IDs for a given city name
@@ -141,6 +134,102 @@ def get_airports_by_city_name(cursor, city_name: str):
     """
     cursor.execute(query, (city_name,))
     return [row[0] for row in cursor.fetchall()]
+
+from fastapi import HTTPException
+from datetime import datetime
+from typing import List
+
+from fastapi import HTTPException
+from typing import List
+from datetime import datetime
+
+from datetime import datetime
+from typing import List
+from fastapi import HTTPException
+
+@app.post("/flights/internal-search")
+async def search_internal_flight(request: FlightSearchRequest):
+    """
+    Search for a single internal (domestic) flight using city names.
+    Returns one flight with full departure and arrival datetime, matching booking endpoint style.
+    """
+    try:
+        parsed_date = datetime.strptime(request.travel_date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid travel_date format. Use YYYY-MM-DD.")
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Get airport IDs by city
+        source_airport_ids = get_airports_by_city_name(cursor, request.source_city)
+        dest_airport_ids = get_airports_by_city_name(cursor, request.destination_city)
+
+        if not source_airport_ids:
+            raise HTTPException(status_code=404, detail=f"No airports found for source city: {request.source_city}")
+        if not dest_airport_ids:
+            raise HTTPException(status_code=404, detail=f"No airports found for destination city: {request.destination_city}")
+
+        source_placeholders = ",".join(["?"] * len(source_airport_ids))
+        dest_placeholders = ",".join(["?"] * len(dest_airport_ids))
+
+        query = f"""
+        SELECT TOP 1
+            f.flight_id,
+            a.airline_name,
+            f.flight_number,
+            src.iata_code AS source_airport,
+            dest.iata_code AS destination_airport,
+            f.departure_time,
+            f.arrival_time,
+            f.duration_minutes,
+            f.base_price,
+            CASE 
+                WHEN fi.available_seats IS NOT NULL THEN fi.available_seats
+                ELSE f.total_seats
+            END AS available_seats
+        FROM Flight f
+        INNER JOIN Airline a ON f.airline_id = a.airline_id
+        INNER JOIN Airport src ON f.source_airport = src.airport_id
+        INNER JOIN Airport dest ON f.destination_airport = dest.airport_id
+        LEFT JOIN Flight_Instance fi ON f.flight_id = fi.flight_id 
+            AND fi.flight_date = ?
+            AND fi.is_deleted = 0
+        WHERE f.source_airport IN ({source_placeholders})
+          AND f.destination_airport IN ({dest_placeholders})
+          AND f.is_deleted = 0
+          AND (
+              (fi.available_seats IS NOT NULL AND fi.available_seats >= ?) OR
+              (fi.available_seats IS NULL AND f.total_seats >= ?)
+          )
+        ORDER BY f.base_price ASC, f.departure_time ASC
+        """
+
+        params = [parsed_date] + source_airport_ids + dest_airport_ids + [request.seats_required, request.seats_required]
+        cursor.execute(query, params)
+        row = cursor.fetchone()
+
+        if not row:
+            raise HTTPException(status_code=404, detail="No matching internal flight found.")
+
+        # Combine travel_date + time to form full datetime
+        dep_time = row[5] or datetime.min.time()
+        arr_time = row[6] or datetime.min.time()
+        departure_datetime = datetime.combine(parsed_date, dep_time)
+        arrival_datetime = datetime.combine(parsed_date, arr_time)
+
+        return [{
+        "flight_id": row[0],
+        "airline_name": row[1],
+        "flight_number": row[2],
+        "source_airport": row[3],
+        "destination_airport": row[4],
+        "departure_time": departure_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "arrival_time": arrival_datetime.strftime("%Y-%m-%d %H:%M:%S"),
+        "duration_minutes": row[7],
+        "base_price": float(row[8]),
+        "available_seats": row[9]
+    }]
 
 @app.post("/flights/search", response_model=List[ConnectingFlightResult])
 async def search_flights(request: FlightSearchRequest):
@@ -163,7 +252,7 @@ async def search_flights(request: FlightSearchRequest):
         dest_placeholders = ','.join(['?'] * len(dest_airport_ids))
         
         query = f"""
-        SELECT TOP 5
+        SELECT 
             f.flight_id,
             a.airline_name,
             f.flight_number,
@@ -193,32 +282,39 @@ async def search_flights(request: FlightSearchRequest):
                 (fi.available_seats IS NULL AND f.total_seats >= ?)
             )
         ORDER BY f.base_price ASC, f.departure_time ASC
+        OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
         """
         
-        params = [request.travel_date] + source_airport_ids + dest_airport_ids + [request.seats_required, request.seats_required]
+        params = [request.travel_date] + source_airport_ids + dest_airport_ids + [request.seats_required, request.seats_required, request.limit]
         
         cursor.execute(query, params)
         
         results = []
+        travel_date = datetime.strptime(request.travel_date, "%Y-%m-%d").date()
+
         for row in cursor.fetchall():
+            departure_dt = datetime.combine(travel_date, row[5])
+            arrival_dt = datetime.combine(travel_date, row[6])
+
             flight = FlightResult(
                 flight_id=row[0],
                 airline_name=row[1],
                 flight_number=row[2],
                 source_airport=row[3],
                 destination_airport=row[4],
-                departure_time=row[5],
-                arrival_time=row[6],
+                departure_time=departure_dt,
+                arrival_time=arrival_dt,
                 duration_minutes=row[7],
                 base_price=float(row[8]),
-                arrival_day_offset=row[9],
                 available_seats=row[10]
             )
+
             results.append(ConnectingFlightResult(
                 total_duration_minutes=flight.duration_minutes,
                 total_price=flight.base_price,
                 flights=[flight]
             ))
+
         
         return results
 
