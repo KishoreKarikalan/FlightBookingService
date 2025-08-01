@@ -326,89 +326,17 @@ async def search_connecting_flights(request: FlightSearchRequest):
     with get_db_connection() as conn:
         cursor = conn.cursor()
         
-        # Debug: Print request details
-        print(f"Request: {request}")
-        
-        # Get airport IDs for source and destination cities
         source_airport_ids = get_airports_by_city_name(cursor, request.source_city)
         dest_airport_ids = get_airports_by_city_name(cursor, request.destination_city)
-        
-        print(f"Source airport IDs for {request.source_city}: {source_airport_ids}")
-        print(f"Dest airport IDs for {request.destination_city}: {dest_airport_ids}")
         
         if not source_airport_ids:
             raise HTTPException(status_code=404, detail=f"No airports found for source city: {request.source_city}")
         if not dest_airport_ids:
             raise HTTPException(status_code=404, detail=f"No airports found for destination city: {request.destination_city}")
         
-        # First, let's check for potential first leg flights
         source_placeholders = ','.join(['?'] * len(source_airport_ids))
-        
-        debug_query1 = f"""
-        SELECT f.flight_id, f.flight_number, f.source_airport, f.destination_airport,
-               f.departure_time, f.arrival_time
-        FROM Flight f
-        WHERE f.source_airport IN ({source_placeholders})
-        AND f.is_deleted = 0
-        """
-        
-        cursor.execute(debug_query1, source_airport_ids)
-        first_leg_flights = cursor.fetchall()
-        print(f"First leg flights from source cities: {len(first_leg_flights)}")
-        for flight in first_leg_flights:
-            print(f"  Flight {flight[1]}: {flight[2]} → {flight[3]} ({flight[4]} - {flight[5]})")
-        
-        # Check for potential second leg flights
         dest_placeholders = ','.join(['?'] * len(dest_airport_ids))
-        
-        debug_query2 = f"""
-        SELECT f.flight_id, f.flight_number, f.source_airport, f.destination_airport,
-               f.departure_time, f.arrival_time
-        FROM Flight f
-        WHERE f.destination_airport IN ({dest_placeholders})
-        AND f.is_deleted = 0
-        """
-        
-        cursor.execute(debug_query2, dest_airport_ids)
-        second_leg_flights = cursor.fetchall()
-        print(f"Second leg flights to destination cities: {len(second_leg_flights)}")
-        for flight in second_leg_flights:
-            print(f"  Flight {flight[1]}: {flight[2]} → {flight[3]} ({flight[4]} - {flight[5]})")
-        
-        # Simplified connecting flights query without time constraints first
-        simple_query = f"""
-        SELECT 
-            f1.flight_id as first_flight_id,
-            f1.flight_number as first_flight_number,
-            f1.source_airport, f1.destination_airport as layover,
-            f1.departure_time as first_departure,
-            f1.arrival_time as first_arrival,
-            
-            f2.flight_id as second_flight_id,
-            f2.flight_number as second_flight_number,
-            f2.source_airport as layover2, f2.destination_airport,
-            f2.departure_time as second_departure,
-            f2.arrival_time as second_arrival
-            
-        FROM Flight f1
-        INNER JOIN Flight f2 ON f1.destination_airport = f2.source_airport
-        
-        WHERE f1.source_airport IN ({source_placeholders})
-            AND f2.destination_airport IN ({dest_placeholders})
-            AND f1.is_deleted = 0
-            AND f2.is_deleted = 0
-        """
-        
-        params = source_airport_ids + dest_airport_ids
-        cursor.execute(simple_query, params)
-        simple_connections = cursor.fetchall()
-        
-        print(f"Simple connections found (without time/seat constraints): {len(simple_connections)}")
-        for conn in simple_connections:
-            print(f"  {conn[1]} ({conn[2]}→{conn[3]}) + {conn[7]} ({conn[8]}→{conn[9]})")
-            print(f"    Times: {conn[4]}-{conn[5]} → {conn[10]}-{conn[11]}")
-        
-        # Now the full query with constraints
+
         query = f"""
         WITH ConnectingFlights AS (
             SELECT 
@@ -417,8 +345,10 @@ async def search_connecting_flights(request: FlightSearchRequest):
                 f1.flight_number as first_flight_number,
                 src1.iata_code as first_source_airport,
                 layover.iata_code as layover_airport,
-                CAST(f1.departure_time AS TIME) as first_departure,
-                CAST(f1.arrival_time AS TIME) as first_arrival,
+                DATEADD(SECOND, DATEDIFF(SECOND, 0, f1.departure_time), CAST(? AS DATETIME)) AS first_departure,
+                DATEADD(DAY, f1.arrival_day_offset,
+                    DATEADD(SECOND, DATEDIFF(SECOND, 0, f1.arrival_time), CAST(? AS DATETIME))
+                ) AS first_arrival,
                 f1.duration_minutes as first_duration,
                 f1.base_price as first_price,
                 f1.arrival_day_offset as first_arrival_day_offset,
@@ -426,13 +356,15 @@ async def search_connecting_flights(request: FlightSearchRequest):
                     WHEN fi1.available_seats IS NOT NULL THEN fi1.available_seats
                     ELSE f1.total_seats
                 END as first_available_seats,
-                
+
                 f2.flight_id as second_flight_id,
                 a2.airline_name as second_airline_name,
                 f2.flight_number as second_flight_number,
                 dest2.iata_code as second_dest_airport,
-                CAST(f2.departure_time AS TIME) as second_departure,
-                CAST(f2.arrival_time AS TIME) as second_arrival,
+                DATEADD(SECOND, DATEDIFF(SECOND, 0, f2.departure_time), CAST(? AS DATETIME)) AS second_departure,
+                DATEADD(DAY, f2.arrival_day_offset,
+                    DATEADD(SECOND, DATEDIFF(SECOND, 0, f2.arrival_time), CAST(? AS DATETIME))
+                ) AS second_arrival,
                 f2.duration_minutes as second_duration,
                 f2.base_price as second_price,
                 f2.arrival_day_offset as second_arrival_day_offset,
@@ -440,10 +372,10 @@ async def search_connecting_flights(request: FlightSearchRequest):
                     WHEN fi2.available_seats IS NOT NULL THEN fi2.available_seats
                     ELSE f2.total_seats
                 END as second_available_seats,
-                
+
                 (f1.duration_minutes + f2.duration_minutes) as total_duration,
                 (f1.base_price + f2.base_price) as total_price
-                
+
             FROM Flight f1
             INNER JOIN Airline a1 ON f1.airline_id = a1.airline_id
             INNER JOIN Airport src1 ON f1.source_airport = src1.airport_id
@@ -451,14 +383,14 @@ async def search_connecting_flights(request: FlightSearchRequest):
             LEFT JOIN Flight_Instance fi1 ON f1.flight_id = fi1.flight_id 
                 AND fi1.flight_date = ? 
                 AND fi1.is_deleted = 0
-            
+
             INNER JOIN Flight f2 ON f1.destination_airport = f2.source_airport
             INNER JOIN Airline a2 ON f2.airline_id = a2.airline_id
             INNER JOIN Airport dest2 ON f2.destination_airport = dest2.airport_id
             LEFT JOIN Flight_Instance fi2 ON f2.flight_id = fi2.flight_id 
                 AND fi2.flight_date = ? 
                 AND fi2.is_deleted = 0
-            
+
             WHERE f1.source_airport IN ({source_placeholders})
                 AND f2.destination_airport IN ({dest_placeholders})
                 AND f1.is_deleted = 0
@@ -471,29 +403,27 @@ async def search_connecting_flights(request: FlightSearchRequest):
                     (fi2.available_seats IS NOT NULL AND fi2.available_seats >= ?) OR
                     (fi2.available_seats IS NULL AND f2.total_seats >= ?)
                 )
-                -- Removed time constraints for now to test
         )
         SELECT TOP 5 *
         FROM ConnectingFlights
         ORDER BY total_price ASC, total_duration ASC
         """
-        
-        # Prepare parameters
+
         params = [
-            request.travel_date,  # For first flight instance
-            request.travel_date   # For second flight instance
+            request.travel_date,  # f1.departure_time
+            request.travel_date,  # f1.arrival_time
+            request.travel_date,  # f2.departure_time
+            request.travel_date,  # f2.arrival_time
+            request.travel_date,  # fi1.flight_date
+            request.travel_date,  # fi2.flight_date
         ] + source_airport_ids + dest_airport_ids + [
-            request.seats_required,  # First flight instance check
-            request.seats_required,  # First flight total seats check
-            request.seats_required,  # Second flight instance check
-            request.seats_required   # Second flight total seats check
+            request.seats_required, request.seats_required,
+            request.seats_required, request.seats_required
         ]
-        
-        print(f"Executing main query with params: {params}")
+
         cursor.execute(query, params)
         rows = cursor.fetchall()
-        print(f"Main query returned {len(rows)} results")
-        
+
         results = []
         for row in rows:
             flights = [
@@ -514,7 +444,7 @@ async def search_connecting_flights(request: FlightSearchRequest):
                     flight_id=row[11],
                     airline_name=row[12],
                     flight_number=row[13],
-                    source_airport=row[4],  # Layover airport
+                    source_airport=row[4],  # Layover
                     destination_airport=row[14],
                     departure_time=row[15],
                     arrival_time=row[16],
@@ -524,15 +454,15 @@ async def search_connecting_flights(request: FlightSearchRequest):
                     available_seats=row[20]
                 )
             ]
-            
+
             results.append(ConnectingFlightResult(
                 total_duration_minutes=row[21],
                 total_price=float(row[22]),
                 flights=flights
             ))
-        
-        return results
 
+        return results
+    
 @app.post("/flights/book", response_model=BookingResponse)
 async def book_flight(request: BookingRequest):
     with get_db_connection() as conn:
