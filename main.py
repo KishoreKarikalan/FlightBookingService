@@ -22,6 +22,8 @@ class FlightResult(BaseModel):
     flight_number: str
     source_airport: str
     destination_airport: str
+    source_city: str  # Added
+    destination_city: str  # Added
     departure_time: datetime
     arrival_time: datetime
     duration_minutes: int
@@ -68,6 +70,12 @@ class BookingDetailResponse(BaseModel):
     flight_id: int
     flight_number: str
     airline_name: str
+    source_airport_code: str
+    source_airport_name: str
+    source_city_name: str
+    destination_airport_code: str
+    destination_airport_name: str
+    destination_city_name: str
     status: str
     total_price: float
     passenger_count: int
@@ -79,7 +87,6 @@ class BookingDetailResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.strftime("%Y-%m-%d %H:%M")
         }
-
 
 # Database connection manager
 @contextmanager
@@ -273,10 +280,12 @@ async def search_flights(request: FlightSearchRequest):
         placeholders_src = ','.join(['?'] * len(source_ids))
         placeholders_dst = ','.join(['?'] * len(dest_ids))
 
+        # Updated query to include city names via City table JOIN
         query = f"""
         SELECT 
             f.flight_id, a.airline_name, f.flight_number,
             src.iata_code, dest.iata_code,
+            src_city.city_name, dest_city.city_name,
             CAST(f.departure_time AS TIME), CAST(f.arrival_time AS TIME),
             f.duration_minutes, f.base_price, f.arrival_day_offset,
             COALESCE(fi.available_seats, f.total_seats)
@@ -284,6 +293,8 @@ async def search_flights(request: FlightSearchRequest):
         INNER JOIN Airline a ON f.airline_id = a.airline_id
         INNER JOIN Airport src ON f.source_airport = src.airport_id
         INNER JOIN Airport dest ON f.destination_airport = dest.airport_id
+        INNER JOIN City src_city ON src.city_id = src_city.city_id
+        INNER JOIN City dest_city ON dest.city_id = dest_city.city_id
         LEFT JOIN Flight_Instance fi ON fi.flight_id = f.flight_id
             AND fi.flight_date = ? AND fi.is_deleted = 0
         WHERE f.source_airport IN ({placeholders_src})
@@ -306,15 +317,16 @@ async def search_flights(request: FlightSearchRequest):
 
         results = []
         for row in cursor.fetchall():
-            departure = datetime.combine(travel_date, row[5])
-            arrival = datetime.combine(travel_date, row[6])
+            departure = datetime.combine(travel_date, row[7])  # Updated index
+            arrival = datetime.combine(travel_date, row[8])    # Updated index
 
             flight = FlightResult(
                 flight_id=row[0], airline_name=row[1], flight_number=row[2],
                 source_airport=row[3], destination_airport=row[4],
+                source_city=row[5], destination_city=row[6],  # Added city names
                 departure_time=departure, arrival_time=arrival,
-                duration_minutes=row[7], base_price=float(row[8]),
-                arrival_day_offset=row[9], available_seats=row[10]
+                duration_minutes=row[9], base_price=float(row[10]),  # Updated indices
+                arrival_day_offset=row[11], available_seats=row[12]   # Updated indices
             )
 
             results.append(ConnectingFlightResult(
@@ -341,11 +353,13 @@ async def search_connecting_flights(request: FlightSearchRequest):
         placeholders_src = ','.join(['?'] * len(source_ids))
         placeholders_dst = ','.join(['?'] * len(dest_ids))
 
+        # Updated query to include city names via City table JOINs
         query = f"""
         WITH Connecting AS (
             SELECT 
                 f1.flight_id AS f1_flight_id, a1.airline_name AS f1_airline_name, f1.flight_number AS f1_flight_number,
                 ap1.iata_code AS f1_source_airport, ap2.iata_code AS f1_dest_airport,
+                src_city1.city_name AS f1_source_city, dest_city1.city_name AS f1_dest_city,
                 DATEADD(SECOND, DATEDIFF(SECOND, 0, f1.departure_time), CAST(? AS DATETIME)) AS f1_departure_time,
                 DATEADD(DAY, f1.arrival_day_offset, DATEADD(SECOND, DATEDIFF(SECOND, 0, f1.arrival_time), CAST(? AS DATETIME))) AS f1_arrival_time,
                 f1.duration_minutes AS f1_duration, f1.base_price AS f1_price, f1.arrival_day_offset AS f1_offset,
@@ -353,6 +367,7 @@ async def search_connecting_flights(request: FlightSearchRequest):
 
                 f2.flight_id AS f2_flight_id, a2.airline_name AS f2_airline_name, f2.flight_number AS f2_flight_number,
                 ap2.iata_code AS f2_source_airport, ap3.iata_code AS f2_dest_airport,
+                dest_city1.city_name AS f2_source_city, dest_city2.city_name AS f2_dest_city,
                 DATEADD(SECOND, DATEDIFF(SECOND, 0, f2.departure_time), CAST(? AS DATETIME)) AS f2_departure_time,
                 DATEADD(DAY, f2.arrival_day_offset, DATEADD(SECOND, DATEDIFF(SECOND, 0, f2.arrival_time), CAST(? AS DATETIME))) AS f2_arrival_time,
                 f2.duration_minutes AS f2_duration, f2.base_price AS f2_price, f2.arrival_day_offset AS f2_offset,
@@ -367,6 +382,9 @@ async def search_connecting_flights(request: FlightSearchRequest):
             JOIN Airport ap1 ON f1.source_airport = ap1.airport_id
             JOIN Airport ap2 ON f1.destination_airport = ap2.airport_id
             JOIN Airport ap3 ON f2.destination_airport = ap3.airport_id
+            JOIN City src_city1 ON ap1.city_id = src_city1.city_id
+            JOIN City dest_city1 ON ap2.city_id = dest_city1.city_id
+            JOIN City dest_city2 ON ap3.city_id = dest_city2.city_id
             LEFT JOIN Flight_Instance fi1 ON fi1.flight_id = f1.flight_id AND fi1.flight_date = ? AND fi1.is_deleted = 0
             LEFT JOIN Flight_Instance fi2 ON fi2.flight_id = f2.flight_id AND fi2.flight_date = ? AND fi2.is_deleted = 0
             WHERE f1.source_airport IN ({placeholders_src})
@@ -411,26 +429,27 @@ async def search_connecting_flights(request: FlightSearchRequest):
             f1 = FlightResult(
                 flight_id=r[0], airline_name=r[1], flight_number=r[2],
                 source_airport=r[3], destination_airport=r[4],
-                departure_time=r[5], arrival_time=r[6],
-                duration_minutes=r[7], base_price=float(r[8]),
-                arrival_day_offset=r[9], available_seats=r[10]
+                source_city=r[5], destination_city=r[6],  # Added city names
+                departure_time=r[7], arrival_time=r[8],
+                duration_minutes=r[9], base_price=float(r[10]),
+                arrival_day_offset=r[11], available_seats=r[12]
             )
             f2 = FlightResult(
-                flight_id=r[11], airline_name=r[12], flight_number=r[13],
-                source_airport=r[14], destination_airport=r[15],
-                departure_time=r[16], arrival_time=r[17],
-                duration_minutes=r[18], base_price=float(r[19]),
-                arrival_day_offset=r[20], available_seats=r[21]
+                flight_id=r[13], airline_name=r[14], flight_number=r[15],
+                source_airport=r[16], destination_airport=r[17],
+                source_city=r[18], destination_city=r[19],  # Added city names
+                departure_time=r[20], arrival_time=r[21],
+                duration_minutes=r[22], base_price=float(r[23]),
+                arrival_day_offset=r[24], available_seats=r[25]
             )
             results.append(ConnectingFlightResult(
-                total_duration_minutes=r[22],
-                total_price=float(r[23]),
+                total_duration_minutes=r[26],  # Updated index
+                total_price=float(r[27]),      # Updated index
                 flights=[f1, f2]
             ))
 
         return results
-
-    
+        
 @app.post("/flights/book", response_model=BookingResponse)
 async def book_flight(request: BookingRequest):
     with get_db_connection() as conn:
@@ -542,25 +561,37 @@ from fastapi import HTTPException
 
 @app.get("/booking/{booking_id}", response_model=BookingDetailResponse)
 async def get_booking_details(booking_id: int):
-    """Get full booking details including passenger list"""
+    """Get full booking details including passenger list and airport/city information"""
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        # Booking summary with departure and arrival times from Flight table
+        # Enhanced booking summary with airport names and city names
         summary_query = """
         SELECT 
             b.booking_id,
             b.flight_id,
             f.flight_number,
             a.airline_name,
-            b.travel_date,      -- date
-            f.departure_time,   -- time
-            f.arrival_time,     -- time
+            b.travel_date,          -- date
+            f.departure_time,       -- time
+            f.arrival_time,         -- time
             b.status,
-            b.total_price
+            b.total_price,
+            -- Source airport and city information
+            src_airport.iata_code AS source_airport_code,
+            src_airport.airport_name AS source_airport_name,
+            src_city.city_name AS source_city_name,
+            -- Destination airport and city information
+            dest_airport.iata_code AS destination_airport_code,
+            dest_airport.airport_name AS destination_airport_name,
+            dest_city.city_name AS destination_city_name
         FROM Booking b
         INNER JOIN Flight f ON b.flight_id = f.flight_id
         INNER JOIN Airline a ON f.airline_id = a.airline_id
+        INNER JOIN Airport src_airport ON f.source_airport = src_airport.airport_id
+        INNER JOIN Airport dest_airport ON f.destination_airport = dest_airport.airport_id
+        INNER JOIN City src_city ON src_airport.city_id = src_city.city_id
+        INNER JOIN City dest_city ON dest_airport.city_id = dest_city.city_id
         WHERE b.booking_id = ?
         """
 
@@ -608,6 +639,12 @@ async def get_booking_details(booking_id: int):
             flight_id=summary[1],
             flight_number=summary[2],
             airline_name=summary[3],
+            source_airport_code=summary[9],
+            source_airport_name=summary[10],
+            source_city_name=summary[11],
+            destination_airport_code=summary[12],
+            destination_airport_name=summary[13],
+            destination_city_name=summary[14],
             departure_time=departure_datetime,
             arrival_time=arrival_datetime,
             status=summary[7],
