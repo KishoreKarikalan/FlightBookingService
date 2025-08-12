@@ -7,7 +7,42 @@ from contextlib import contextmanager
 import os
 from dataclasses import dataclass
 
+from fastapi import FastAPI, Request, HTTPException
+from starlette.middleware.base import BaseHTTPMiddleware
+from pydantic import BaseModel
+from typing import Optional, List
+import json
+import os
+
+# -----------------------------
+# Load allowed fingerprints
+# -----------------------------
+def load_fingerprints(path: str = "allowed_fingerprints.json") -> set:
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+            return set(data.get("fingerprints", []))
+    except FileNotFoundError:
+        return set()
+
+ALLOWED_FINGERPRINTS = load_fingerprints()
+
+# -----------------------------
+# Middleware to enforce fingerprint check
+# -----------------------------
+class FingerprintAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        fingerprint = request.headers.get("x-client-cert-fingerprint")
+        print(f"Received fingerprint: {fingerprint}")
+        if fingerprint not in ALLOWED_FINGERPRINTS:
+            raise HTTPException(status_code=403, detail="Client certificate not authorized")
+        return await call_next(request)
+
+# -----------------------------
+# FastAPI App
+# -----------------------------
 app = FastAPI(title="Flight Booking API", version="1.0.0")
+app.add_middleware(FingerprintAuthMiddleware)
 
 class FlightSearchRequest(BaseModel):
     source_city: str = Field(..., description="Source city name")
