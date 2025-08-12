@@ -10,6 +10,10 @@ DATABASE_CONNECTION_STRING = (
     "Encrypt=no;"
 )
 
+# External API settings
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "https://api.example.com/flight-alternatives")
+EXTERNAL_API_TIMEOUT = int(os.getenv("EXTERNAL_API_TIMEOUT", "30"))
+
 def load_fingerprints(path: str = "allowed_fingerprints.json") -> set:
     """Load allowed fingerprints from JSON file"""
     try:

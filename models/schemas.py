@@ -42,6 +42,27 @@ class ConnectingFlightResult(BaseModel):
     total_price: float
     flights: List[FlightResult]
 
+# Flight Cancellation Models
+class FlightCancellationRequest(BaseModel):
+    flight_id: int = Field(..., description="Flight ID to cancel")
+    flight_date: str = Field(..., description="Date of flight to cancel (YYYY-MM-DD)")
+    reason: str = Field(..., description="Reason for cancellation")
+
+class FlightCancellationResponse(BaseModel):
+    success: bool
+    message: str
+    cancelled_flight_id: int
+    affected_bookings: int
+    alternatives_sent: bool
+
+class AlternativeFlightData(BaseModel):
+    cancelled_flight_id: int
+    cancelled_flight_date: str
+    source_city: str
+    destination_city: str
+    affected_passengers: List[dict]
+    alternative_flights: List[ConnectingFlightResult]
+
 # Booking Models
 class PassengerDetail(BaseModel):
     name: str = Field(..., description="Passenger's full name")

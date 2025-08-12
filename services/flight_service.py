@@ -1,15 +1,199 @@
 from fastapi import HTTPException
 from typing import List
 from datetime import datetime, date, time
+from datetime import timedelta
 
 from models.schemas import (
     FlightSearchRequest, FlightResult, FlightResultAll, 
-    ConnectingFlightResult
+    ConnectingFlightResult, FlightCancellationRequest, FlightCancellationResponse,
+    AlternativeFlightData
 )
 from database.connection import get_db_connection, get_airports_by_city_name
+from services.external_service import ExternalService
 
 class FlightService:
     """Service class for flight-related operations"""
+    
+    def __init__(self):
+        self.external_service = ExternalService()
+    
+    async def cancel_flight(self, request: FlightCancellationRequest) -> FlightCancellationResponse:
+        print("DEBUG: Starting cancel_flight...")
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                conn.autocommit = False
+                print(f"DEBUG: Received request: {request}")
+
+                # Step 1: Get flight details
+                print("DEBUG: Fetching flight details...")
+                flight_details_query = """
+                    SELECT 
+                        f.flight_id,
+                        f.flight_number,
+                        a.airline_name,
+                        src_airport.iata_code AS source_airport,
+                        dest_airport.iata_code AS destination_airport,
+                        src_city.city_name AS source_city,
+                        dest_city.city_name AS destination_city,
+                        f.departure_time,
+                        f.arrival_time,
+                        f.duration_minutes,
+                        f.base_price,
+                        fi.flight_date,
+                        fi.available_seats,
+                        fi.is_deleted
+                    FROM Flight_Instance fi
+                    INNER JOIN Flight f 
+                        ON fi.flight_id = f.flight_id
+                    INNER JOIN Airline a 
+                        ON f.airline_id = a.airline_id
+                    INNER JOIN Airport src_airport 
+                        ON f.source_airport = src_airport.airport_id
+                    INNER JOIN Airport dest_airport 
+                        ON f.destination_airport = dest_airport.airport_id
+                    INNER JOIN City src_city 
+                        ON src_airport.city_id = src_city.city_id
+                    INNER JOIN City dest_city 
+                        ON dest_airport.city_id = dest_city.city_id
+                    WHERE f.flight_id = ? 
+                    AND fi.flight_date = ? 
+                    AND f.is_deleted = 0
+                """
+                cursor.execute(flight_details_query, (request.flight_id,request.flight_date))
+                flight_details = cursor.fetchone()
+                print(f"DEBUG: Flight details fetched: {flight_details}")
+
+                if not flight_details:
+                    print("DEBUG: No flight found.")
+                    raise HTTPException(status_code=404, detail="Flight not found or already deleted")
+                
+                # Step 2: Get affected bookings
+                print("DEBUG: Fetching affected bookings...")
+                affected_bookings_query = """
+                SELECT 
+                    b.booking_id,
+                    b.user_id,
+                    b.total_price,
+                    p.name,
+                    p.age,
+                    p.gender,
+                    p.passport_no
+                FROM Booking b
+                LEFT JOIN Passenger p ON b.booking_id = p.booking_id
+                WHERE b.flight_id = ? AND b.travel_date = ? AND b.status != 'cancelled'
+                """
+                cursor.execute(affected_bookings_query, (request.flight_id, request.flight_date))
+                booking_results = cursor.fetchall()
+                print(f"DEBUG: Found {len(booking_results)} affected bookings")
+
+                affected_passengers = []
+                booking_ids = set()
+
+                for row in booking_results:
+                    booking_ids.add(row[0])
+                    if row[3]:
+                        affected_passengers.append({
+                            "booking_id": row[0],
+                            "user_id": row[1],
+                            "total_price": float(row[2]),
+                            "passenger_name": row[3],
+                            "passenger_age": row[4],
+                            "passenger_gender": row[5],
+                            "passport_no": row[6]
+                        })
+
+                # Step 3: Cancel bookings
+                print("DEBUG: Cancelling affected bookings...")
+                cancel_bookings_query = """
+                UPDATE Booking 
+                SET status = 'cancelled_by_airline', 
+                    booking_date = GETDATE()
+                WHERE flight_id = ? AND travel_date = ? AND status != 'cancelled'
+                """
+                cursor.execute(cancel_bookings_query, (request.flight_id, request.flight_date))
+                affected_bookings_count = cursor.rowcount
+                print(f"DEBUG: {affected_bookings_count} bookings cancelled")
+
+                # Step 4: Cancel flight instance
+                print("DEBUG: Cancelling flight instance...")
+                cancel_flight_instance_query = """
+                UPDATE Flight_Instance 
+                SET is_deleted = 1, available_seats = 0
+                WHERE flight_id = ? AND flight_date = ?
+                """
+                cursor.execute(cancel_flight_instance_query, (request.flight_id, request.flight_date))
+                if cursor.rowcount == 0:
+                    print("DEBUG: No existing flight instance, inserting cancelled one")
+                    create_cancelled_instance_query = """
+                    INSERT INTO Flight_Instance (flight_id, flight_date, available_seats, is_deleted)
+                    VALUES (?, ?, 0, 1)
+                    """
+                    cursor.execute(create_cancelled_instance_query, (request.flight_id, request.flight_date))
+
+                conn.commit()
+                print("DEBUG: Transaction committed successfully.")
+
+                # Step 5: Search alternatives
+                print("DEBUG: Searching for alternative flights...")
+                search_request = FlightSearchRequest(
+                    source_city=flight_details[5],
+                    destination_city=flight_details[6],
+                    travel_datetime=request.flight_date,
+                    seats_required=1,
+                    limit=2
+                )
+                print(request.flight_date)
+                print("DEBUG: Search request prepared:", search_request)
+                alternative_flights = await self.search_all_flights(search_request)
+                print(f"DEBUG: Found {len(alternative_flights)} alternative flight groups")
+
+                alternative_flights = [
+                    flight for flight in alternative_flights
+                    if not any(f.flight_id == request.flight_id for f in flight.flights)
+                ]
+
+                # Step 6: Prepare data for external service
+                print("DEBUG: Preparing data for external service...")
+                alternative_data = AlternativeFlightData(
+                    cancelled_flight_id=request.flight_id,
+                    cancelled_flight_date=request.flight_date,
+                    source_city=flight_details[5],
+                    destination_city=flight_details[6],
+                    affected_passengers=affected_passengers,
+                    alternative_flights=alternative_flights
+                )
+
+                print("DEBUG: Sending flight alternatives (simulated)...")
+                alternatives_sent = await self.external_service.send_flight_alternatives(alternative_data)
+
+                print("DEBUG: Sending cancellation notification (simulated)...")
+                await self.external_service.notify_flight_cancellation(
+                    request.flight_id,
+                    request.flight_date,
+                    request.reason
+                )
+
+                conn.commit()
+                print("DEBUG: Transaction committed successfully.")
+
+                return FlightCancellationResponse(
+                    success=True,
+                    message=f"Flight {request.flight_id} cancelled successfully. {affected_bookings_count} bookings affected.",
+                    cancelled_flight_id=request.flight_id,
+                    affected_bookings=affected_bookings_count,
+                    alternatives_sent=alternatives_sent
+                )
+
+            except Exception as e:
+                print(f"DEBUG: Exception occurred: {e}")
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Flight cancellation failed: {str(e)}")
+            finally:
+                conn.autocommit = True
+                print("DEBUG: cancel_flight finished.")
+
     
     async def search_internal_flight(self, request: FlightSearchRequest):
         """Search for a single internal (domestic) flight using city names"""
@@ -99,25 +283,45 @@ class FlightService:
                 "available_seats": row[9]
             }]
 
+    
+
     async def search_all_flights(self, request: FlightSearchRequest) -> List[ConnectingFlightResult]:
-        """Search for all flights (direct + connecting)"""
-        # Check if travel_datetime is a datetime object
+        print(f"[DEBUG] Starting search_all_flights for {request.travel_datetime}")
+
         if not isinstance(request.travel_datetime, datetime):
-            raise HTTPException(status_code=400, detail="Invalid datetime format. Use ISO 8601 format like '2025-08-01T10:30:00'.")
+            raise HTTPException(
+                status_code=400, 
+                detail="Invalid datetime format. Use ISO 8601 format like '2025-08-01T10:30:00'."
+            )
 
-        # Call direct flight search
-        direct_flights = await self.search_direct_flights(request)
+        all_results = []
 
-        # If enough direct flights found, return limited
-        if len(direct_flights) >= request.limit:
-            return direct_flights[:request.limit]
+        for day_offset in [0, 1]:  # Today and next day
+            date_to_search = request.travel_datetime + timedelta(days=day_offset)
+            req_copy = FlightSearchRequest(
+                source_city=request.source_city,
+                destination_city=request.destination_city,
+                travel_datetime=date_to_search,
+                seats_required=request.seats_required,
+                limit=request.limit
+            )
 
-        # Otherwise, get remaining from connecting flights
-        remaining = request.limit - len(direct_flights)
-        connecting_flights = await self.search_connecting_flights(request)
-        combined = direct_flights + connecting_flights[:remaining]
+            direct_flights = await self.search_direct_flights(req_copy)
+            connecting_flights = []
+            
+            if len(direct_flights) < req_copy.limit:
+                remaining = req_copy.limit - len(direct_flights)
+                connecting_flights = await self.search_connecting_flights(req_copy)
+                connecting_flights = connecting_flights[:remaining]
 
-        return combined
+            combined = direct_flights + connecting_flights
+            all_results.extend(combined)
+
+            if len(all_results) >= request.limit:
+                break  # Stop if we have enough results
+
+        return all_results[:request.limit]
+
 
     async def search_direct_flights(self, request: FlightSearchRequest) -> List[ConnectingFlightResult]:
         """Search for direct flights only"""
@@ -139,7 +343,7 @@ class FlightService:
                 src_city.city_name, dest_city.city_name,
                 CAST(f.departure_time AS TIME), CAST(f.arrival_time AS TIME),
                 f.duration_minutes, f.base_price, f.arrival_day_offset,
-                COALESCE(fi.available_seats, f.total_seats)
+                COALESCE(fi.available_seats, f.total_seats) AS available_seats
             FROM Flight f
             INNER JOIN Airline a ON f.airline_id = a.airline_id
             INNER JOIN Airport src ON f.source_airport = src.airport_id
@@ -149,21 +353,28 @@ class FlightService:
             LEFT JOIN Flight_Instance fi ON fi.flight_id = f.flight_id
                 AND fi.flight_date = ? AND fi.is_deleted = 0
             WHERE f.source_airport IN ({placeholders_src})
-                AND f.destination_airport IN ({placeholders_dst})
-                AND f.is_deleted = 0
-                AND CAST(f.departure_time AS TIME) >= ?
-                AND (
-                    (fi.available_seats IS NOT NULL AND fi.available_seats >= ?) OR
-                    (fi.available_seats IS NULL AND f.total_seats >= ?)
-                )
+            AND f.destination_airport IN ({placeholders_dst})
+            AND f.is_deleted = 0
+            AND CAST(f.departure_time AS TIME) >= ?
+            AND (
+                (fi.available_seats IS NOT NULL AND fi.available_seats >= ?)
+                OR (fi.available_seats IS NULL AND f.total_seats >= ?)
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM Flight_Instance fi2
+                WHERE fi2.flight_id = f.flight_id
+                    AND fi2.flight_date = ?
+                    AND fi2.is_deleted = 1
+            )
             ORDER BY f.base_price ASC, f.departure_time ASC
             OFFSET 0 ROWS FETCH NEXT ? ROWS ONLY
+
             """
 
             travel_date = request.travel_datetime.date()
             travel_time = request.travel_datetime.time()
 
-            params = [travel_date] + source_ids + dest_ids + [travel_time, request.seats_required, request.seats_required, request.limit]
+            params = [travel_date] + source_ids + dest_ids + [travel_time, request.seats_required, request.seats_required, travel_date, request.limit]
             cursor.execute(query, params)
 
             results = []

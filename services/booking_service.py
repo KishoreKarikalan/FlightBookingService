@@ -12,6 +12,7 @@ class BookingService:
     
     async def book_flight(self, request: BookingRequest) -> BookingResponse:
         """Book a flight with passenger details"""
+        print(f"Booking request: {request}")
         with get_db_connection() as conn:
             cursor = conn.cursor()
             try:
