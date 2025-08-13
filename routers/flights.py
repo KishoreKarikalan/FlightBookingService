@@ -4,7 +4,7 @@ from datetime import datetime, date, time
 
 from models.schemas import (
     FlightSearchRequest, FlightResult, FlightResultAll, 
-    ConnectingFlightResult, FlightCancellationRequest, FlightCancellationResponse
+    ConnectingFlightResult, FlightCancellationRequest, FlightCancellationResponse, BookingCancellationRequest
 )
 from database.connection import get_db_connection, get_airports_by_city_name
 from services.flight_service import FlightService
@@ -44,3 +44,17 @@ async def get_all_flights():
 async def cancel_flight(request: FlightCancellationRequest):
     """Cancel an entire flight and send alternatives to external endpoint"""
     return await flight_service.cancel_flight(request)
+
+@router.post("/bookings/cancel")
+async def cancel_bookings(
+    request: BookingCancellationRequest,
+):
+    """
+    Cancel multiple flight bookings
+    
+    - **flight_booking_ids**: List of booking IDs to cancel
+    
+    Returns 200 OK with success status and message
+    """
+    result = await flight_service.cancel_bookings(request)
+    return result

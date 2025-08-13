@@ -42,7 +42,6 @@ class ConnectingFlightResult(BaseModel):
     total_price: float
     flights: List[FlightResult]
 
-# Flight Cancellation Models
 class FlightCancellationRequest(BaseModel):
     flight_id: int = Field(..., description="Flight ID to cancel")
     flight_date: str = Field(..., description="Date of flight to cancel (YYYY-MM-DD)")
@@ -110,3 +109,7 @@ class BookingDetailResponse(BaseModel):
         json_encoders = {
             datetime: lambda v: v.strftime("%Y-%m-%d %H:%M")
         }
+
+class BookingCancellationRequest(BaseModel):
+    """Request model for cancelling multiple bookings"""
+    flight_booking_ids: List[int]

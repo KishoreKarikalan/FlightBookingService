@@ -1,4 +1,4 @@
-from fastapi import HTTPException
+from fastapi import HTTPException, Response
 from typing import List
 from datetime import datetime, date, time
 from datetime import timedelta
@@ -6,7 +6,7 @@ from datetime import timedelta
 from models.schemas import (
     FlightSearchRequest, FlightResult, FlightResultAll, 
     ConnectingFlightResult, FlightCancellationRequest, FlightCancellationResponse,
-    AlternativeFlightData
+    AlternativeFlightData, BookingCancellationRequest
 )
 from database.connection import get_db_connection, get_airports_by_city_name
 from services.external_service import ExternalService
@@ -569,3 +569,89 @@ class FlightService:
                 status_code=500,
                 detail=f"Database connection error: {str(e)}"
             )
+        
+    async def cancel_bookings(self, request: BookingCancellationRequest):
+        """Cancel multiple bookings by booking IDs"""
+        if not request.flight_booking_ids:
+            raise HTTPException(status_code=400, detail="No booking IDs provided")
+        
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            try:
+                conn.autocommit = False
+                
+                # Step 1: Validate booking IDs exist and are not already cancelled
+                booking_ids_placeholders = ",".join(["?"] * len(request.flight_booking_ids))
+                
+                validate_query = f"""
+                    SELECT booking_id, status
+                    FROM Booking
+                    WHERE booking_id IN ({booking_ids_placeholders})
+                """
+                
+                cursor.execute(validate_query, request.flight_booking_ids)
+                existing_bookings = cursor.fetchall()
+                
+                if not existing_bookings:
+                    raise HTTPException(status_code=404, detail="No valid bookings found")
+                
+                # Check for invalid booking IDs
+                found_booking_ids = {row[0] for row in existing_bookings}
+                invalid_ids = set(request.flight_booking_ids) - found_booking_ids
+                if invalid_ids:
+                    raise HTTPException(
+                        status_code=404, 
+                        detail=f"Booking IDs not found: {list(invalid_ids)}"
+                    )
+                
+                # Check for already cancelled bookings
+                cancelled_bookings = [row[0] for row in existing_bookings if 'cancelled' in row[1].lower()]
+                if cancelled_bookings:
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Bookings already cancelled: {cancelled_bookings}"
+                    )
+                
+                # Step 2: Update booking status to cancelled
+                cancel_bookings_query = f"""
+                    UPDATE Booking 
+                    SET status = 'cancelled_by_user'
+                    WHERE booking_id IN ({booking_ids_placeholders})
+                    AND status NOT LIKE '%cancelled%'
+                """
+                
+                cursor.execute(cancel_bookings_query, request.flight_booking_ids)
+                
+                # Step 3: Update available seats for affected flights
+                seat_update_query = f"""
+                    UPDATE fi
+                    SET available_seats = available_seats + passenger_counts.passenger_count
+                    FROM Flight_Instance fi
+                    INNER JOIN (
+                        SELECT 
+                            b.flight_id,
+                            b.travel_date,
+                            COUNT(p.passenger_id) as passenger_count
+                        FROM Booking b
+                        LEFT JOIN Passenger p ON b.booking_id = p.booking_id
+                        WHERE b.booking_id IN ({booking_ids_placeholders})
+                        GROUP BY b.flight_id, b.travel_date
+                    ) passenger_counts ON fi.flight_id = passenger_counts.flight_id 
+                                        AND fi.flight_date = passenger_counts.travel_date
+                """
+                
+                cursor.execute(seat_update_query, request.flight_booking_ids)
+                
+                conn.commit()
+                
+                return Response(status_code=200)  # ✅ Empty response with 200 OK
+                
+            except HTTPException:
+                conn.rollback()
+                raise
+            except Exception as e:
+                conn.rollback()
+                raise HTTPException(status_code=500, detail=f"Booking cancellation failed: {str(e)}")
+            finally:
+                conn.autocommit = True
